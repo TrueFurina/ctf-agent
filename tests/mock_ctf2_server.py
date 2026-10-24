@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import json
 import threading
+import time
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -80,6 +82,10 @@ class MockCTF2Server:
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
+                # 显式关闭连接，避免 httpx 在 Windows 上复用已关闭的连接
+                # （http.server 默认 HTTP/1.0，配合 httpx keep-alive 偶发
+                #  WinError 10054 / httpx.ReadError，导致集成测试随机失败）
+                self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(body)
 
@@ -132,6 +138,27 @@ class MockCTF2Server:
         self.base_url = f"http://127.0.0.1:{self.port}"
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()
+        self._wait_until_ready()
+
+    def _wait_until_ready(self, timeout: float = 5.0) -> None:
+        """Block until the server actually accepts and serves a request.
+
+        Without this, a client may connect in the race window between
+        thread.start() and serve_forever() picking up the backlog, which
+        surfaces as an intermittent httpx.ReadError under the full suite.
+        """
+        url = self.base_url + "/api/open/v1/user/agent/me"
+        deadline = time.time() + timeout
+        last: Exception | None = None
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen(url, timeout=0.5) as r:
+                    if r.status == 200:
+                        return
+            except Exception as e:  # noqa: BLE001 - any failure means "not ready yet"
+                last = e
+                time.sleep(0.02)
+        raise RuntimeError(f"mock CTF² server not ready on {self.base_url}: {last}")
 
     def _env_route(self, handler, cid: str) -> None:
         cfg = self.env_config.get(cid, {})
